@@ -19,11 +19,8 @@ import os
 import fitz  # PyMuPDF
 
 
-ANNOTATION_TEMPLATE = (
-    "Hours correction = {adjustment} | "
-    "New total hours = {corrected_total} | "
-    "Reason for correction = Unrecorded PTO"
-)
+ANNOTATION_LINE1 = "Hours correction = {adjustment} | New total hours = {corrected_total}"
+ANNOTATION_LINE2 = "Reason for correction = Unrecorded PTO"
 
 # Vertical gap between bottom of "Approved by:" text and top of annotation
 Y_OFFSET = 4  # points
@@ -33,23 +30,20 @@ def find_approved_by_instances(page):
     """
     Return one rect per distinct (panel, timesheet-row) combination.
 
-    The PDF has two side-by-side panels per page.  Within each panel there may
-    be multiple "Approved by:" labels at nearly the same Y (DocuSign artefact);
-    those should collapse to one annotation.  But the left panel and right panel
-    are independent and each need their own annotation even if their Y values are
-    close.
-
     Strategy
     --------
-    1. Split rects into LEFT panel (x0 < PAGE_MID) and RIGHT panel (x0 >= PAGE_MID).
-    2. Within each panel, cluster by Y proximity and keep the topmost rect per cluster.
-    3. Return all surviving rects from both panels.
+    1. Find the natural X gap between the left and right panels by looking at
+       the largest gap in sorted x0 values.  This handles pages where the right
+       panel starts before the nominal page midpoint.
+    2. Split rects into LEFT / RIGHT panels at that gap.
+    3. Within each panel, cluster by Y proximity (DocuSign duplicate artefacts)
+       and keep the topmost rect per cluster.
+    4. Return one representative rect per surviving cluster.
     """
     all_rects = page.search_for("Approved by:")
     if not all_rects:
         return []
 
-    page_mid = page.rect.width / 2
     Y_CLUSTER_TOLERANCE = 10  # points
 
     def cluster_by_y(rects):
@@ -64,35 +58,43 @@ def find_approved_by_instances(page):
                     break
             if not placed:
                 groups.append([rect])
-        # Keep the topmost (lowest y0) rect from each cluster
         return [min(g, key=lambda r: r.y0) for g in groups]
 
-    left_rects  = [r for r in all_rects if r.x0 <  page_mid]
-    right_rects = [r for r in all_rects if r.x0 >= page_mid]
+    # Find the panel split by locating the largest gap in x0 values
+    sorted_x = sorted(set(round(r.x0) for r in all_rects))
+    if len(sorted_x) > 1:
+        gaps = [(sorted_x[i+1] - sorted_x[i], sorted_x[i], sorted_x[i+1])
+                for i in range(len(sorted_x) - 1)]
+        largest_gap = max(gaps, key=lambda g: g[0])
+        x_split = (largest_gap[1] + largest_gap[2]) / 2
+    else:
+        x_split = page.rect.width / 2
+
+    left_rects  = [r for r in all_rects if r.x0 <= x_split]
+    right_rects = [r for r in all_rects if r.x0 >  x_split]
 
     return cluster_by_y(left_rects) + cluster_by_y(right_rects)
 
 
-def insert_annotation(page, rect, annotation_text, font_size):
-    """Insert annotation text just below the given rect."""
+def insert_annotation(page, rect, line1, line2, font_size):
+    """Insert two-line annotation just below the given rect."""
     x = rect.x0
-    y = rect.y1 + Y_OFFSET + font_size  # fitz inserts text at baseline
+    line_height = font_size * 1.2  # standard leading
 
-    page.insert_text(
-        (x, y),
-        annotation_text,
-        fontsize=font_size,
-        color=(0, 0, 0),
-    )
+    # First line
+    y1 = rect.y1 + Y_OFFSET + font_size
+    page.insert_text((x, y1), line1, fontsize=font_size, color=(0, 0, 0))
+
+    # Second line
+    y2 = y1 + line_height
+    page.insert_text((x, y2), line2, fontsize=font_size, color=(0, 0, 0))
 
 
 def annotate_pdf(input_path, output_path, adjustment, corrected_total):
     doc = fitz.open(input_path)
 
-    annotation_text = ANNOTATION_TEMPLATE.format(
-        adjustment=adjustment,
-        corrected_total=corrected_total,
-    )
+    line1 = ANNOTATION_LINE1.format(adjustment=adjustment, corrected_total=corrected_total)
+    line2 = ANNOTATION_LINE2
 
     total_insertions = 0
 
@@ -102,14 +104,12 @@ def annotate_pdf(input_path, output_path, adjustment, corrected_total):
             continue
 
         for rect in instances:
-            # Measure the font size of the "Approved by:" text by inspecting
-            # the text blocks on this page and matching by bbox proximity.
             font_size = get_font_size_near_rect(page, rect)
-            insert_annotation(page, rect, annotation_text, font_size)
+            insert_annotation(page, rect, line1, line2, font_size)
             total_insertions += 1
             print(
                 f"  Page {page_num}: inserted below 'Approved by:' at y={rect.y1:.1f} "
-                f"(font size {font_size:.1f}pt)"
+                f"x={rect.x0:.1f} (font size {font_size:.1f}pt)"
             )
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
